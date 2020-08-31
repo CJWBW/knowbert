@@ -4,3 +4,5 @@ pytest
 nltk
 ipython
 spacy
+pickle-mixin
+pandas
