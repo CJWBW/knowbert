@@ -196,6 +196,100 @@ class BertTokenizerAndCandidateGenerator(Registrable):
         fields['offsets_b'] = offsets_b
         return fields
 
+    def custom_tokenize_and_generate_candidates(self, text_a, metadata):
+        """
+        only consider one sentence and metadata
+        """
+        offsets_a, grouped_wp_a, tokens_a = self._tokenize_text(text_a)
+        offsets_metadata, grouped_wp_metadata, tokens_metadata = self._tokenize_text(metadata)
+
+        length_a = sum([len(x) for x in grouped_wp_a])
+        while self.max_word_piece_sequence_length - 2 < length_a:
+            discarded = grouped_wp_a.pop()
+            length_a -= len(discarded)
+
+        length_metadata = sum([len(x) for x in grouped_wp_metadata])
+        while self.max_word_piece_sequence_length - 2 < length_metadata:
+            discarded = grouped_wp_metadata.pop()
+            length_metadata -= len(discarded)
+
+        word_piece_tokens_a = [word_piece for word in grouped_wp_a for word_piece in word]
+        offsets_a = offsets_a[:len(grouped_wp_a)]
+        tokens_a = tokens_a[:len(grouped_wp_a)]
+        instance_a = self._generate_sentence_entity_candidates(tokens_a, offsets_a)
+
+        word_piece_tokens_metadata = [word_piece for word in grouped_wp_metadata for word_piece in word]
+        offsets_metadata = offsets_metadata[:len(grouped_wp_metadata)]
+        tokens_metadata = tokens_metadata[:len(grouped_wp_metadata)]
+        instance_metadata = self._generate_sentence_entity_candidates(tokens_metadata, offsets_metadata)
+
+        tokens_a = [start_token] + word_piece_tokens_a + [sep_token]
+        segment_ids_a = len(tokens_a) * [0]
+        offsets_a = [x + 1 for x in offsets_a]
+
+        tokens_metadata = [start_token] + word_piece_tokens_metadata + [sep_token]
+        segment_ids_metadata = len(tokens_metadata) * [0]
+        offsets_metadata = [x + 1 for x in offsets_metadata]
+
+        for name in instance_a.keys():
+            for span in instance_a[name]['candidate_spans']:
+                span[0] += 1
+                span[1] += 1
+
+        for name in instance_metadata.keys():
+            for span in instance_metadata[name]['candidate_spans']:
+                span[0] += 1
+                span[1] += 1
+
+        fields: Dict[str, Sequence] = {}
+
+        candidates_a = instance_a
+        candidates_metadata = instance_metadata
+
+        for candidates in [candidates_a, candidates_metadata]:
+            segment_ids = segment_ids_a if candidates == candidates_a else segment_ids_metadata
+            for entity_type in candidates.keys():
+                # deal with @@PADDING@@
+                if len(candidates[entity_type]['candidate_entities']) == 0:
+                    candidates[entity_type] = get_empty_candidates()
+                else:
+                    padding_indices = []
+                    has_entity = False
+                    for cand_i, candidate_list in enumerate(candidates[entity_type]['candidate_entities']):
+                        if candidate_list == ["@@PADDING@@"]:
+                            padding_indices.append(cand_i)
+                            candidates[entity_type]["candidate_spans"][cand_i] = [-1, -1]
+                        else:
+                            has_entity = True
+                    indices_to_remove = []
+                    if has_entity and len(padding_indices) > 0:
+                        # remove all the padding entities since have some valid
+                        indices_to_remove = padding_indices
+                    elif len(padding_indices) > 0:
+                        assert len(padding_indices) == len(candidates[entity_type]['candidate_entities'])
+                        indices_to_remove = padding_indices[1:]
+                    for ind in reversed(indices_to_remove):
+                        del candidates[entity_type]["candidate_spans"][ind]
+                        del candidates[entity_type]["candidate_entities"][ind]
+                        del candidates[entity_type]["candidate_entity_priors"][ind]
+
+            # get the segment ids for the spans
+            for key, cands in candidates.items():
+                span_segment_ids = []
+                for candidate_span in cands['candidate_spans']:
+                    span_segment_ids.append(segment_ids[candidate_span[0]])
+                candidates[key]['candidate_segment_ids'] = span_segment_ids
+
+        fields['tokens'] = tokens_a
+        fields['segment_ids'] = segment_ids_a
+        fields['candidates'] = candidates_a
+        fields['offsets_a'] = offsets_a
+        fields['tokens_metadata'] = tokens_metadata
+        fields['segment_ids_metadata'] = segment_ids_metadata
+        fields['candidates_metadata'] = candidates_metadata
+        fields['offsets_metadata'] = offsets_metadata
+        return fields
+
     def _tokenize_text(self, text):
         if self.whitespace_tokenize:
             tokens = text.split()
@@ -288,6 +382,95 @@ class BertTokenizerAndCandidateGenerator(Registrable):
             all_candidates[key] = DictField(candidate_fields)
 
         fields["candidates"] = DictField(all_candidates)
+
+        return fields
+
+    def custom_convert_tokens_candidates_to_fields(self, tokens_and_candidates):
+        """
+        tokens_and_candidates is the return from a previous call to
+        generate_sentence_entity_candidates.  Converts the dict to
+        a dict of fields usable with allennlp.
+        """
+        fields = {}
+
+        fields['tokens'] = TextField(
+                [Token(t, text_id=self.bert_tokenizer.vocab[t])
+                    for t in tokens_and_candidates['tokens']],
+                token_indexers=self._bert_single_id_indexer
+        )
+
+        fields['tokens_metadata'] = TextField(
+                [Token(t, text_id=self.bert_tokenizer.vocab[t])
+                    for t in tokens_and_candidates['tokens_metadata']],
+                token_indexers=self._bert_single_id_indexer
+        )
+
+        fields['segment_ids'] = ArrayField(
+            np.array(tokens_and_candidates['segment_ids']), dtype=np.int
+        )
+        fields['segment_ids_metadata'] = ArrayField(
+            np.array(tokens_and_candidates['segment_ids_metadata']), dtype=np.int
+        )
+
+        all_candidates = {}
+        for key, entity_candidates in tokens_and_candidates['candidates'].items():
+            # pad the prior to create the array field
+            # make a copy to avoid modifying the input
+            candidate_entity_prior = copy.deepcopy(
+                    entity_candidates['candidate_entity_priors']
+            )
+            max_cands = max(len(p) for p in candidate_entity_prior)
+            for p in candidate_entity_prior:
+                if len(p) < max_cands:
+                    p.extend([0.0] * (max_cands - len(p)))
+            np_prior = np.array(candidate_entity_prior)
+
+            candidate_fields = {
+                "candidate_entity_priors": ArrayField(np_prior, dtype=self.dtype),
+                "candidate_entities": TextField(
+                    [Token(" ".join(candidate_list)) for candidate_list in entity_candidates["candidate_entities"]],
+                    token_indexers={'ids': self._entity_indexers[key]}),
+                "candidate_spans": ListField(
+                    [SpanField(span[0], span[1], fields['tokens']) for span in
+                    entity_candidates['candidate_spans']]
+                ),
+                "candidate_segment_ids": ArrayField(
+                    np.array(entity_candidates['candidate_segment_ids']), dtype=np.int
+        )
+            }
+            all_candidates[key] = DictField(candidate_fields)
+
+        fields["candidates"] = DictField(all_candidates)
+
+        all_candidates_metadata = {}
+        for key, entity_candidates in tokens_and_candidates['candidates_metadata'].items():
+            # pad the prior to create the array field
+            # make a copy to avoid modifying the input
+            candidate_entity_prior = copy.deepcopy(
+                    entity_candidates['candidate_entity_priors']
+            )
+            max_cands = max(len(p) for p in candidate_entity_prior)
+            for p in candidate_entity_prior:
+                if len(p) < max_cands:
+                    p.extend([0.0] * (max_cands - len(p)))
+            np_prior = np.array(candidate_entity_prior)
+
+            candidate_fields = {
+                "candidate_entity_priors": ArrayField(np_prior, dtype=self.dtype),
+                "candidate_entities": TextField(
+                    [Token(" ".join(candidate_list)) for candidate_list in entity_candidates["candidate_entities"]],
+                    token_indexers={'ids': self._entity_indexers[key]}),
+                "candidate_spans": ListField(
+                    [SpanField(span[0], span[1], fields['tokens_metadata']) for span in
+                    entity_candidates['candidate_spans']]
+                ),
+                "candidate_segment_ids": ArrayField(
+                    np.array(entity_candidates['candidate_segment_ids']), dtype=np.int
+        )
+            }
+            all_candidates_metadata[key] = DictField(candidate_fields)
+
+        fields["candidates_metadata"] = DictField(all_candidates_metadata)
 
         return fields
 

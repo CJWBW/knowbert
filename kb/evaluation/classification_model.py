@@ -19,17 +19,17 @@ from pytorch_pretrained_bert.modeling import gelu, BertLayerNorm
 @Model.register('simple-classifier')
 class SimpleClassifier(Model):
     def __init__(self, vocab: Vocabulary,
-                       model: Model,
-                       task: str,
-                       num_labels: int,
-                       bert_dim: int,
-                       metric_a: Metric,
-                       metric_b: Metric = None,
-                       concat_word_a_b: bool = False,
-                       concat_word_a: bool = False,
-                       include_cls: bool = True,
-                       dropout_prob: float = 0.1,
-                       use_bce_loss: bool = False):
+                 model: Model,
+                 task: str,
+                 num_labels: int,
+                 bert_dim: int,
+                 metric_a: Metric,
+                 metric_b: Metric = None,
+                 concat_word_a_b: bool = False,
+                 concat_word_a: bool = False,
+                 include_cls: bool = True,
+                 dropout_prob: float = 0.1,
+                 use_bce_loss: bool = False):
 
         super().__init__(vocab)
         assert task == 'regression' or task == 'classification', task
@@ -78,7 +78,6 @@ class SimpleClassifier(Model):
             self.loss = torch.nn.MSELoss()
         self.use_bce_loss = use_bce_loss
 
-
     def forward(self, tokens=None, segment_ids=None, candidates=None, label_ids=None, **kwargs):
         model_output = self.model(tokens=tokens, segment_ids=segment_ids,
                                   candidates=candidates,
@@ -87,14 +86,14 @@ class SimpleClassifier(Model):
 
         if self.concat_word_a_b:
             # concat the selected words in index_a, index_b
-            # (batch_size, timesteps, dim)
+            # (batch_size, max_len, dim)
             contextual_embeddings = model_output['contextual_embeddings']
             word_a = batched_index_select(contextual_embeddings, kwargs['index_a'])
             word_b = batched_index_select(contextual_embeddings, kwargs['index_b'])
             if self.include_cls:
                 pooled_output = torch.cat([model_output['pooled_output'],
-                                       word_a,
-                                       word_b], dim=-1)
+                                           word_a,
+                                           word_b], dim=-1)
             else:
                 pooled_output = torch.cat([word_a, word_b], dim=-1)
         elif self.concat_word_a:
@@ -102,7 +101,7 @@ class SimpleClassifier(Model):
             word_a = batched_index_select(contextual_embeddings, kwargs['index_a'])
             if self.include_cls:
                 pooled_output = torch.cat([model_output['pooled_output'],
-                                       word_a], dim=-1)
+                                           word_a], dim=-1)
             else:
                 pooled_output = word_a
         else:

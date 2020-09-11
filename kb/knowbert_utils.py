@@ -1,15 +1,13 @@
-
 from typing import Union, List
 
 from allennlp.common import Params
 from allennlp.data import Instance, DataIterator, Vocabulary
 from allennlp.common.file_utils import cached_path
-
+from allennlp.data.fields import LabelField, ListField
 
 from kb.include_all import TokenizerAndCandidateGenerator
 from kb.bert_pretraining_reader import replace_candidates_with_mask_entity
 
-import json
 
 
 def _extract_config_from_archive(model_archive):
@@ -96,12 +94,12 @@ class KnowBertBatchifier:
             if verbose:
                 print(self._replace_mask(sentence_or_sentence_pair))
                 print(tokens_candidates['tokens'])
+                print('candidate keys: {:}'.format(tokens_candidates['candidates'].keys()))
 
             # now modify the masking if needed
             if self.masking_strategy == 'full_mask':
                 # replace the mask span with a @@mask@@ span
-                masked_indices = [index for index, token in enumerate(tokens_candidates['tokens'])
-                      if token == '[MASK]']
+                masked_indices = [index for index, token in enumerate(tokens_candidates['tokens']) if token == '[MASK]']
 
                 spans_to_mask = set([(i, i) for i in masked_indices])
                 replace_candidates_with_mask_entity(
@@ -123,13 +121,37 @@ class KnowBertBatchifier:
                             # hack, assume only one sentence
                             assert not isinstance(sentence_or_sentence_pair, list)
 
-
             fields = self.tokenizer_and_candidate_generator.\
                 convert_tokens_candidates_to_fields(tokens_candidates)
 
             instances.append(Instance(fields))
-
+            print('+++++++++++++++++++++++++++++++++++++++++++++++++++++')
+            print(f'fields: {fields}')
+            print('tokens: {:}'.format(fields['tokens']))
+            print('segment_ids: {:}'.format(fields['segment_ids']))
+            print('candidates: {:}'.format(fields['candidates']))
+            print(f'{Instance(fields).__class__}: {Instance(fields).__dict__}')
 
         for batch in self.iterator(instances, num_epochs=1, shuffle=False):
             yield batch
 
+    def iter_batches_sentences_with_metadata_and_labels(self, sentences, metadata, categorical_numerical_data, labels, verbose=False):
+        # create instances
+        instances = []
+        for sentence, label in zip(sentences, labels):
+
+            tokens_candidates = self.tokenizer_and_candidate_generator.custom_tokenize_and_generate_candidates(self._replace_mask(sentence))
+
+            if verbose:
+                print(self._replace_mask(sentence))
+                print(tokens_candidates['tokens'])
+                print('candidate keys: {:}'.format(tokens_candidates['candidates'].keys()))
+
+            fields = self.tokenizer_and_candidate_generator.custom_convert_tokens_candidates_to_fields(tokens_candidates)
+
+            fields['label_ids'] = LabelField(label, skip_indexing=True)
+            fields['categorical_numerical_data'] = ListField(categorical_numerical_data)
+            instances.append(Instance(fields))
+
+        for batch in self.iterator(instances, num_epochs=1, shuffle=False):
+            yield batch
